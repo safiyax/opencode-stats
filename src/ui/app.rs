@@ -385,7 +385,9 @@ impl App {
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.copy_current_page();
             }
-            KeyCode::Char('f') if matches!(self.page, Page::Models | Page::Providers) => {
+            KeyCode::Char('f') | KeyCode::Char('/')
+                if matches!(self.page, Page::Models | Page::Providers) =>
+            {
                 self.enter_search();
             }
             KeyCode::Char(value) => {
