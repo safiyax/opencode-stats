@@ -50,7 +50,7 @@ impl Theme {
     pub fn builtin_dark() -> Self {
         Self {
             foreground: Color::Rgb(229, 233, 240),
-            card_background: Color::Rgb(28, 33, 43),
+            card_background: Color::Rgb(26, 26, 26),
             card_border: Color::Rgb(120, 130, 155),
             card_shadow: Color::Rgb(0, 0, 0),
             muted: Color::Rgb(128, 134, 152),
