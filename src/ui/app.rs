@@ -26,7 +26,7 @@ use crate::utils::pricing::ZeroCostBehavior;
 use crate::utils::time::TimeRange;
 
 const VIEWPORT_HEIGHT: u16 = 23;
-const STATUS_TTL: Duration = Duration::from_secs(1);
+const STATUS_TTL: Duration = Duration::from_secs(3);
 const TICK_TIME_MS: u16 = 200;
 
 #[derive(Clone, Debug)]

@@ -271,6 +271,12 @@ fn draw_buffer_text(
             let fg = color_to_rgba(cell.fg, palette.default_foreground);
             let px = origin_x + u32::from(x) * metrics.cell_width;
             let py = origin_y + u32::from(y) * metrics.cell_height;
+
+            if let Some(pattern) = braille_pattern(symbol) {
+                draw_braille_cell(image, px, py, metrics, fg, pattern);
+                continue;
+            }
+
             let draw_x = px as i32 + metrics.glyph_x_offset;
             let draw_y = py as i32 + metrics.line_top_padding;
 
@@ -296,6 +302,48 @@ fn draw_buffer_text(
             }
 
             skip = cell_span.saturating_sub(1) as usize;
+        }
+    }
+}
+
+fn braille_pattern(symbol: &str) -> Option<u8> {
+    let mut chars = symbol.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() || !('\u{2800}'..='\u{28ff}').contains(&ch) {
+        return None;
+    }
+
+    Some((ch as u32 - 0x2800) as u8)
+}
+
+fn draw_braille_cell(
+    image: &mut RgbaImage,
+    x: u32,
+    y: u32,
+    metrics: &Metrics,
+    color: Rgba<u8>,
+    pattern: u8,
+) {
+    const DOT_BITS: [[u8; 2]; 4] = [[0, 3], [1, 4], [2, 5], [6, 7]];
+
+    let dot_size = metrics.cell_width.div_ceil(5).clamp(2, 3);
+    for (row, bits) in DOT_BITS.iter().enumerate() {
+        for (column, bit) in bits.iter().enumerate() {
+            if pattern & (1u8 << *bit) == 0 {
+                continue;
+            }
+
+            let center_x = (2 * column as u32 + 1) * metrics.cell_width / 4;
+            let center_y = (2 * row as u32 + 1) * metrics.cell_height / 8;
+            draw_filled_rect_mut(
+                image,
+                ImageRect::at(
+                    (x + center_x.saturating_sub(dot_size / 2)) as i32,
+                    (y + center_y.saturating_sub(dot_size / 2)) as i32,
+                )
+                .of_size(dot_size, dot_size),
+                color,
+            );
         }
     }
 }
@@ -444,4 +492,47 @@ fn xterm_index_to_rgba(index: u8) -> Rgba<u8> {
     let b = palette_index % 6;
     let component = |value: u8| if value == 0 { 0 } else { value * 40 + 55 };
     Rgba([component(r), component(g), component(b), 255])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_single_braille_symbols() {
+        assert_eq!(braille_pattern("\u{2800}"), Some(0));
+        assert_eq!(braille_pattern("\u{2801}"), Some(1));
+        assert_eq!(braille_pattern("\u{28ff}"), Some(u8::MAX));
+        assert_eq!(braille_pattern("a"), None);
+        assert_eq!(braille_pattern("\u{2801}x"), None);
+    }
+
+    #[test]
+    fn keeps_braille_row_pitch_across_cell_boundaries() {
+        let metrics = Metrics {
+            scale: PxScale::from(1.0),
+            cell_width: 14,
+            cell_height: 28,
+            glyph_x_offset: 0,
+            line_top_padding: 0,
+        };
+        let mut image = RgbaImage::new(metrics.cell_width, metrics.cell_height * 2);
+        let color = Rgba([255, 255, 255, 255]);
+
+        draw_braille_cell(&mut image, 0, 0, &metrics, color, u8::MAX);
+        draw_braille_cell(&mut image, 0, metrics.cell_height, &metrics, color, u8::MAX);
+
+        let sample_x = metrics.cell_width / 4;
+        let mut run_starts = Vec::new();
+        let mut in_dot = false;
+        for y in 0..image.height() {
+            let filled = image.get_pixel(sample_x, y)[3] != 0;
+            if filled && !in_dot {
+                run_starts.push(y);
+            }
+            in_dot = filled;
+        }
+
+        assert_eq!(run_starts, vec![2, 9, 16, 23, 30, 37, 44, 51]);
+    }
 }
