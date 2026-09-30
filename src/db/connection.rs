@@ -55,7 +55,11 @@ pub fn default_database_candidates(custom_path: Option<&Path>) -> Vec<PathBuf> {
 pub fn discover_database_path(custom_path: Option<&Path>) -> Option<PathBuf> {
     default_database_candidates(custom_path)
         .into_iter()
-        .find(|candidate| candidate.exists() && database_has_v1_tables(candidate).unwrap_or(false))
+        .find(|candidate| {
+            candidate.exists()
+                && (database_has_v1_tables(candidate).unwrap_or(false)
+                    || database_has_v2_tables(candidate).unwrap_or(false))
+        })
 }
 
 pub fn open_database(path: &Path) -> Result<Connection> {
