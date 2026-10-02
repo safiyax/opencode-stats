@@ -6,6 +6,7 @@ use color_eyre::eyre::Result;
 use colored::{ColoredString, Colorize};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
+use ratatui::backend::{Backend, ClearType};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::prelude::CrosstermBackend;
 use ratatui::widgets::{Block, Padding};
@@ -167,8 +168,15 @@ impl App {
 
     /// 默认的 ratatui::restore 在 Inline Viewport 下有错误的行为，
     /// 此处重置终端以确保光标和输入状态正确恢复
+    ///
+    /// 不使用 `terminal.clear()`：ratatui-core 0.1.2 起它会先查询光标位置，而退出时
+    /// EventStream 的后台线程仍占用输入读取，查询会超时报错。这里直接清除 viewport 区域。
     fn restore(terminal: &mut DefaultTerminal) -> Result<()> {
-        terminal.clear()?;
+        let viewport = terminal.get_frame().area();
+        let backend = terminal.backend_mut();
+        backend.set_cursor_position(viewport.as_position())?;
+        backend.clear_region(ClearType::AfterCursor)?;
+        backend.flush()?;
         crossterm::terminal::disable_raw_mode()?;
         Ok(())
     }
