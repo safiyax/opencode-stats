@@ -56,9 +56,7 @@ pub fn discover_database_path(custom_path: Option<&Path>) -> Option<PathBuf> {
     default_database_candidates(custom_path)
         .into_iter()
         .find(|candidate| {
-            candidate.exists()
-                && (database_has_v1_tables(candidate).unwrap_or(false)
-                    || database_has_v2_tables(candidate).unwrap_or(false))
+            candidate.exists() && database_has_usage_tables(candidate).unwrap_or(false)
         })
 }
 
@@ -67,18 +65,21 @@ pub fn open_database(path: &Path) -> Result<Connection> {
         .map_err(|e| Error::database_open(path, e))
 }
 
-pub fn database_has_tables(path: &Path, check: Vec<&str>) -> Result<bool> {
+pub fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .map_err(Error::database_query)
+}
+
+pub fn database_has_tables(path: &Path, check: &[&str]) -> Result<bool> {
     let conn = open_database(path)?;
 
-    for table in &check {
-        let exists = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-                [table],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(Error::database_query)?;
-        if exists == 0 {
+    for table in check {
+        if !table_exists(&conn, table)? {
             return Ok(false);
         }
     }
@@ -87,11 +88,20 @@ pub fn database_has_tables(path: &Path, check: Vec<&str>) -> Result<bool> {
 }
 
 pub fn database_has_v1_tables(path: &Path) -> Result<bool> {
-    database_has_tables(path, vec!["session", "message", "project"])
+    database_has_tables(path, &["session", "message", "project"])
 }
 
+/// OpenCode v2 keeps sessions in the shared `session` table and writes its messages to
+/// `session_message`. Some pre-release builds used a separate `session_v2` table instead.
 pub fn database_has_v2_tables(path: &Path) -> Result<bool> {
-    database_has_tables(path, vec!["session_v2", "session_message", "project"])
+    Ok(
+        database_has_tables(path, &["session", "session_message", "project"])?
+            || database_has_tables(path, &["session_v2", "session_message", "project"])?,
+    )
+}
+
+pub fn database_has_usage_tables(path: &Path) -> Result<bool> {
+    Ok(database_has_v1_tables(path)? || database_has_v2_tables(path)?)
 }
 
 fn dedupe_preserve_order(paths: Vec<PathBuf>) -> Vec<PathBuf> {

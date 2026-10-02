@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local};
 
-use crate::db::connection::{self, database_has_v2_tables, discover_database_path, open_database};
+use crate::db::connection::{self, discover_database_path, open_database, table_exists};
 use crate::db::errors::{Error, Result};
 use crate::db::models::{
     AppData, DataSourceKind, ImportStats, InputOptions, JsonMessageRecord, MessageRecord,
@@ -40,56 +40,13 @@ pub fn load_app_data(options: &InputOptions) -> Result<AppData> {
 pub fn load_from_sqlite(db_path: &Path) -> Result<AppData> {
     let conn = open_database(db_path)?;
 
-    let has_v2_tables = database_has_v2_tables(db_path)?;
-    let query = format!(
-        "
-        SELECT s.id, s.parent_id, s.title, s.time_created, s.time_updated, s.time_archived,
-               p.name as project_name, p.worktree as project_worktree
-        FROM {} s
-        LEFT JOIN project p ON s.project_id = p.id
-        ORDER BY s.time_created DESC
-        ",
-        if has_v2_tables {
-            "session_v2"
-        } else {
-            "session"
-        }
-    );
-    let mut session_stmt = conn.prepare(&query).map_err(Error::database_query)?;
-
-    let sessions_iter = session_stmt
-        .query_map([], |row| {
-            Ok(SessionRow {
-                id: row.get("id")?,
-                parent_id: row.get("parent_id")?,
-                project_name: row.get("project_name")?,
-                project_worktree: row
-                    .get::<_, Option<String>>("project_worktree")?
-                    .map(PathBuf::from),
-                title: row.get("title")?,
-                time_created: row
-                    .get::<_, Option<i64>>("time_created")?
-                    .and_then(timestamp_ms_to_local),
-                time_updated: row
-                    .get::<_, Option<i64>>("time_updated")?
-                    .and_then(timestamp_ms_to_local),
-                time_archived: row
-                    .get::<_, Option<i64>>("time_archived")?
-                    .and_then(timestamp_ms_to_local),
-            })
-        })
-        .map_err(Error::database_query)?;
-
-    let mut sessions = Vec::new();
-    for session in sessions_iter {
-        sessions.push(session.map_err(Error::database_query)?);
-    }
+    let sessions = load_sessions_sqlite(&conn)?;
 
     let session_lookup = sessions
         .iter()
         .map(|session| (session.id.as_str(), session))
         .collect::<BTreeMap<_, _>>();
-    let sqlite_messages = load_messages_sqlite(&conn, &has_v2_tables, &session_lookup)?;
+    let sqlite_messages = load_messages_sqlite(&conn, &session_lookup)?;
 
     let mut all_events = Vec::new();
     let mut all_messages = Vec::new();
@@ -122,6 +79,61 @@ pub fn load_from_sqlite(db_path: &Path) -> Result<AppData> {
     )
 }
 
+/// Session tables in priority order. OpenCode v1 and v2 share `session`; some pre-release
+/// v2 builds used a separate `session_v2` table.
+const SESSION_TABLES: [&str; 2] = ["session", "session_v2"];
+
+fn load_sessions_sqlite(conn: &rusqlite::Connection) -> Result<Vec<SessionRow>> {
+    let mut sessions = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for table in SESSION_TABLES {
+        if !table_exists(conn, table)? {
+            continue;
+        }
+
+        let query = format!(
+            "
+            SELECT s.id, s.parent_id, s.title, s.time_created, s.time_updated, s.time_archived,
+                   p.name as project_name, p.worktree as project_worktree
+            FROM {table} s
+            LEFT JOIN project p ON s.project_id = p.id
+            ORDER BY s.time_created DESC
+            "
+        );
+        let mut stmt = conn.prepare(&query).map_err(Error::database_query)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SessionRow {
+                    id: row.get("id")?,
+                    parent_id: row.get("parent_id")?,
+                    project_name: row.get("project_name")?,
+                    project_worktree: row
+                        .get::<_, Option<String>>("project_worktree")?
+                        .map(PathBuf::from),
+                    title: row.get("title")?,
+                    time_created: row
+                        .get::<_, Option<i64>>("time_created")?
+                        .and_then(timestamp_ms_to_local),
+                    time_updated: row
+                        .get::<_, Option<i64>>("time_updated")?
+                        .and_then(timestamp_ms_to_local),
+                    time_archived: row
+                        .get::<_, Option<i64>>("time_archived")?
+                        .and_then(timestamp_ms_to_local),
+                })
+            })
+            .map_err(Error::database_query)?;
+
+        for session in rows {
+            let session = session.map_err(Error::database_query)?;
+            if seen.insert(session.id.clone()) {
+                sessions.push(session);
+            }
+        }
+    }
+    Ok(sessions)
+}
+
 struct ParsedMessage {
     record: MessageRecord,
     event: Option<UsageEvent>,
@@ -134,39 +146,61 @@ struct SqliteMessageLoad {
 
 fn load_messages_sqlite(
     conn: &rusqlite::Connection,
-    has_v2_tables: &bool,
     sessions: &BTreeMap<&str, &SessionRow>,
 ) -> Result<SqliteMessageLoad> {
-    let query = if *has_v2_tables {
-        "
-        SELECT session_id, data, type AS role
-        FROM session_message
-        WHERE type IN ('user', 'assistant')
-        ORDER BY session_id ASC, time_created ASC
-        "
-    } else {
-        "
-        SELECT session_id, data, NULL AS role
-        FROM message
-        ORDER BY session_id ASC, time_created ASC
-        "
-    };
-    let mut stmt = conn.prepare(&query).map_err(Error::database_query)?;
+    // OpenCode v1 writes to `message`; v2 writes to `session_message` (role in the `type`
+    // column). Databases upgraded from v1 contain both, so read every table that exists.
+    let mut queries = Vec::new();
+    if table_exists(conn, "message")? {
+        queries.push(
+            "
+            SELECT session_id, data, NULL AS role
+            FROM message
+            ORDER BY session_id ASC, time_created ASC
+            ",
+        );
+    }
+    if table_exists(conn, "session_message")? {
+        queries.push(
+            "
+            SELECT session_id, data, type AS role
+            FROM session_message
+            WHERE type IN ('user', 'assistant')
+            ORDER BY session_id ASC, time_created ASC
+            ",
+        );
+    }
 
-    let mut messages = Vec::new();
-    let mut skipped_messages = 0usize;
+    let mut load = SqliteMessageLoad {
+        messages: Vec::new(),
+        skipped_messages: 0,
+    };
+    for query in queries {
+        load_messages_from_query(conn, query, sessions, &mut load)?;
+    }
+    Ok(load)
+}
+
+fn load_messages_from_query(
+    conn: &rusqlite::Connection,
+    query: &str,
+    sessions: &BTreeMap<&str, &SessionRow>,
+    load: &mut SqliteMessageLoad,
+) -> Result<()> {
+    let mut stmt = conn.prepare(query).map_err(Error::database_query)?;
+
     let mut rows = stmt.query([]).map_err(Error::database_query)?;
     while let Some(row) = rows.next().map_err(Error::database_query)? {
         let session_id: String = row.get("session_id").map_err(Error::database_query)?;
         let Some(session) = sessions.get(session_id.as_str()) else {
-            skipped_messages = skipped_messages.saturating_add(1);
+            load.skipped_messages = load.skipped_messages.saturating_add(1);
             continue;
         };
 
         let data = match row.get_ref("data").map_err(Error::database_query)? {
             rusqlite::types::ValueRef::Text(bytes) => bytes,
             _ => {
-                skipped_messages = skipped_messages.saturating_add(1);
+                load.skipped_messages = load.skipped_messages.saturating_add(1);
                 continue;
             }
         };
@@ -174,7 +208,7 @@ fn load_messages_sqlite(
         let mut record: JsonMessageRecord = match serde_json::from_slice(data) {
             Ok(record) => record,
             Err(_) => {
-                skipped_messages = skipped_messages.saturating_add(1);
+                load.skipped_messages = load.skipped_messages.saturating_add(1);
                 continue;
             }
         };
@@ -186,13 +220,10 @@ fn load_messages_sqlite(
         }
 
         if let Some(message) = parse_json_record(record, session, DataSourceKind::Sqlite) {
-            messages.push(message);
+            load.messages.push(message);
         }
     }
-    Ok(SqliteMessageLoad {
-        messages,
-        skipped_messages,
-    })
+    Ok(())
 }
 
 pub fn load_from_json(path: &Path) -> Result<AppData> {
@@ -604,6 +635,76 @@ mod tests {
         assert_eq!(data.import_stats.skipped_sqlite_messages, 1);
         assert_eq!(data.messages.len(), 1);
         assert_eq!(data.events.len(), 1);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn loads_v1_and_v2_messages_from_upgraded_database() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!("oc-stats-v2-test-{nonce}.db"));
+        let conn = Connection::open(&db_path).unwrap();
+
+        // Mirrors OpenCode v2: `session` is shared, v1 messages live in `message`
+        // and v2 messages in `session_message` with the role in `type`.
+        conn.execute_batch(
+            "
+            CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT);
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT,
+                parent_id TEXT,
+                title TEXT,
+                time_created INTEGER,
+                time_updated INTEGER,
+                time_archived INTEGER
+            );
+            CREATE TABLE message (session_id TEXT, data TEXT, time_created INTEGER);
+            CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                type TEXT,
+                seq INTEGER,
+                data TEXT,
+                time_created INTEGER,
+                time_updated INTEGER
+            );
+            INSERT INTO project VALUES ('proj_1', 'demo', '/tmp/demo');
+            INSERT INTO session (id, project_id, title, time_created, time_updated)
+                VALUES ('ses_v1', 'proj_1', 'Old', 1710000000000, 1710000001000),
+                       ('ses_v2', 'proj_1', 'New', 1720000000000, 1720000001000);
+            INSERT INTO message VALUES ('ses_v1',
+                '{\"role\":\"assistant\",\"providerID\":\"openai\",\"modelID\":\"gpt-5\",\"tokens\":{\"input\":10,\"output\":20},\"time\":{\"created\":1710000000000}}',
+                1710000000000);
+            INSERT INTO session_message VALUES ('msg_1', 'ses_v2', 'user', 1,
+                '{\"text\":\"hi\",\"time\":{\"created\":1720000000000}}', 1720000000000, 1720000000000);
+            INSERT INTO session_message VALUES ('msg_2', 'ses_v2', 'assistant', 2,
+                '{\"agent\":\"build\",\"model\":{\"id\":\"claude-sonnet-4.5\",\"providerID\":\"anthropic\"},\"content\":[],\"cost\":0.5,\"tokens\":{\"input\":5,\"output\":7,\"reasoning\":0,\"cache\":{\"read\":1,\"write\":2}},\"time\":{\"created\":1720000000500,\"completed\":1720000001000}}',
+                1720000000500, 1720000000500);
+            INSERT INTO session_message VALUES ('msg_3', 'ses_v2', 'agent-switched', 3,
+                '{\"agent\":\"plan\",\"time\":{\"created\":1720000002000}}', 1720000002000, 1720000002000);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(super::connection::database_has_v2_tables(&db_path).unwrap());
+        let data = load_from_sqlite(&db_path).unwrap();
+
+        assert_eq!(data.messages.len(), 3);
+        assert_eq!(data.events.len(), 2);
+        let v2 = data
+            .events
+            .iter()
+            .find(|event| event.session_id == "ses_v2")
+            .unwrap();
+        assert_eq!(v2.model_id, "claude-sonnet-4.5");
+        assert_eq!(v2.provider_id.as_deref(), Some("anthropic"));
+        assert_eq!(v2.tokens.total(), 15);
+        assert_eq!(data.sessions.len(), 2);
 
         let _ = fs::remove_file(db_path);
     }
